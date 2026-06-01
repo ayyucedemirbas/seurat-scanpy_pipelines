@@ -14,10 +14,15 @@ import seaborn as sns
 import harmonypy as hm
 from sklearn.decomposition import PCA
 from sklearn.neighbors import NearestNeighbors
+import psutil
 
 sc.settings.verbosity = 3
 sc.set_figure_params(dpi=100, facecolor='white')
 
+def print_memory_usage(step_name: str):
+    process = psutil.Process(os.getpid())
+    mem_mb = process.memory_info().rss / (1024 ** 2)
+    print(f"[Memory Usage] {step_name}: {mem_mb:.2f} MB")
 
 def impute_wnid_scanpy(adata: sc.AnnData, k: int = 3, dropout_thresh: float = 0.9, n_pcs: int = 30, random_state: int = 0):
     X = adata.X
@@ -76,6 +81,8 @@ def impute_wnid_scanpy(adata: sc.AnnData, k: int = 3, dropout_thresh: float = 0.
         adata.X = X_imputed
 
 
+print_memory_usage("Before downloading/loading data")
+
 url = "https://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz"
 filepath = "pbmc3k.tar.gz"
 extract_path = "pbmc3k_extracted"
@@ -93,6 +100,7 @@ if not os.path.exists(data_dir):
 adata = sc.read_10x_mtx(data_dir, var_names='gene_symbols', cache=True)
 adata.var_names_make_unique()
 
+print_memory_usage("After loading raw data")
 
 adata.var['mt'] = adata.var_names.str.startswith('MT-')
 sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
@@ -105,13 +113,16 @@ adata = adata[adata.obs['n_genes_by_counts'] < 2500, :]
 adata = adata[adata.obs['pct_counts_mt'] < 5, :]
 sc.pp.filter_genes(adata, min_cells=3)
 
+print_memory_usage("After QC and filtering")
 
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
 
+print_memory_usage("After normalization and log1p")
 
-impute_wnid_scanpy(adata, k=7, dropout_thresh=0.72, n_pcs=30)
+impute_wnid_scanpy(adata, k=3, dropout_thresh=0.9, n_pcs=30)
 
+print_memory_usage("After WNID imputation")
 
 s_genes = ['MCM5', 'PCNA', 'TYMS', 'FEN1', 'MCM2', 'MCM4', 'RRM1', 'UNG', 'GINS2', 'MCM6']
 g2m_genes = ['HMGB2', 'CDK1', 'NUSAP1', 'UBE2C', 'BIRC5', 'TPX2', 'TOP2A', 'NDC80', 'CKS2', 'NUF2']
@@ -119,13 +130,14 @@ s_genes = [g for g in s_genes if g in adata.var_names]
 g2m_genes = [g for g in g2m_genes if g in adata.var_names]
 sc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes)
 
-
 sc.pp.highly_variable_genes(adata, n_top_genes=2000)
-
 adata.raw = adata
 
 sc.pp.scale(adata, max_value=10)
 adata.obs['batch'] = pd.Categorical(np.random.choice(['Donor_A', 'Donor_B'], size=adata.n_obs))
+
+print_memory_usage("After scaling and setting up batch data")
+
 sc.tl.pca(adata, svd_solver='arpack', n_comps=50)
 
 ho = hm.run_harmony(adata.obsm['X_pca'], adata.obs, ['batch'])
@@ -134,17 +146,20 @@ if ho.Z_corr.shape[0] == adata.n_obs:
 else:
     adata.obsm['X_pca_harmony'] = ho.Z_corr.T
 
+print_memory_usage("After PCA and Harmony integration")
 
 sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40, use_rep='X_pca_harmony')
 sc.tl.umap(adata, min_dist=0.3)
 sc.tl.leiden(adata, resolution=0.5, key_added='leiden')
 
+print_memory_usage("After Neighbors, UMAP, and Leiden clustering")
 
 sc.tl.diffmap(adata)
 root_idx = np.where(adata.obs['leiden'] == '0')[0][0]
 adata.uns['iroot'] = root_idx
 sc.tl.dpt(adata)
 
+print_memory_usage("After Diffusion Pseudotime (DPT)")
 
 sc.tl.rank_genes_groups(adata, groupby='leiden', method='t-test', use_raw=True)
 
@@ -152,13 +167,13 @@ canonical_markers = ['CD3D', 'CD3E', 'CD3G', 'CD19', 'MS4A1', 'CD14', 'LYZ']
 available_markers = [g for g in canonical_markers if g in adata.var_names]
 sc.tl.score_genes(adata, gene_list=[g for g in ['CD3D', 'CD3E'] if g in adata.var_names], score_name='T_cell_score')
 
+print_memory_usage("After differential expression and scoring")
 
 sc.pl.umap(adata, color=['leiden', 'batch'], save='_clusters.png', show=False)
 sc.pl.umap(adata, color='phase', save='_phase.png', show=False)
 
 if available_markers:
     sc.pl.dotplot(adata, var_names=available_markers, groupby='leiden', standard_scale='var', save='_markers.png', show=False)
-
 
 result = adata.uns['rank_genes_groups']
 df_volcano = pd.DataFrame({
@@ -183,7 +198,6 @@ plt.ylabel("-Log10 Adjusted P-value")
 plt.savefig("volcano_cluster0.png", bbox_inches='tight', dpi=100)
 plt.close()
 
-
 df_plot = pd.DataFrame({
     'UMAP1': adata.obsm['X_umap'][:, 0],
     'UMAP2': adata.obsm['X_umap'][:, 1],
@@ -193,4 +207,8 @@ df_plot = pd.DataFrame({
 fig = px.scatter(df_plot, x='UMAP1', y='UMAP2', color='Cluster', hover_data=['Pseudotime'], title='Interactive UMAP')
 fig.write_html("interactive_umap.html")
 
+print_memory_usage("Before saving H5AD file")
+
 adata.write("pbmc3k_full_analysis_scanpy.h5ad")
+
+print_memory_usage("End of script")
