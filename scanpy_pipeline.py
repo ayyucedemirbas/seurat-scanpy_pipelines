@@ -6,14 +6,75 @@ import urllib.request
 import shutil
 import scanpy as sc
 import numpy as np
+import scipy.sparse as sp
 import pandas as pd
 import plotly.express as px
 import matplotlib.pyplot as plt
 import seaborn as sns
 import harmonypy as hm
+from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 
 sc.settings.verbosity = 3
 sc.set_figure_params(dpi=100, facecolor='white')
+
+
+def impute_wnid_scanpy(adata: sc.AnnData, k: int = 3, dropout_thresh: float = 0.9, n_pcs: int = 30, random_state: int = 0):
+    X = adata.X
+    is_sparse = sp.issparse(X)
+
+    if is_sparse:
+        X_dense = X.toarray()
+    else:
+        X_dense = X.copy()
+
+    n_comp = min(n_pcs, X_dense.shape[1] - 1)
+    pca = PCA(n_components=n_comp, random_state=random_state)
+    pca_emb = pca.fit_transform(X_dense)
+
+    nbrs = NearestNeighbors(n_neighbors=k + 1, metric="cosine")
+    nbrs.fit(pca_emb)
+    distances, indices = nbrs.kneighbors(pca_emb)
+
+    gene_means = X_dense.mean(axis=0)
+    gene_vars = X_dense.var(axis=0)
+
+    mu = np.where(gene_means == 0, 1e-12, gene_means)
+    dispersion = gene_vars / mu
+
+    dropout_prob = np.exp(-mu / np.maximum(dispersion, 1e-12))
+    dropout_mask = (X_dense == 0) & (dropout_prob > dropout_thresh)
+
+    X_imputed = X_dense.copy()
+
+    for i in range(X_dense.shape[0]):
+        cell_dropouts = dropout_mask[i]
+
+        if not np.any(cell_dropouts):
+            continue
+
+        neighbor_idx = indices[i, 1:]
+        dists = distances[i, 1:]
+
+        weights = np.exp(-dists)
+        weights_sum = weights.sum()
+
+        if weights_sum == 0:
+            continue
+
+        weights /= weights_sum
+
+        neighbor_expr = X_dense[neighbor_idx][:, cell_dropouts]
+        imputed_values = np.dot(weights, neighbor_expr)
+
+        X_imputed[i, cell_dropouts] = imputed_values
+
+
+    if is_sparse:
+        adata.X = sp.csr_matrix(X_imputed)
+    else:
+        adata.X = X_imputed
+
 
 url = "https://cf.10xgenomics.com/samples/cell-exp/1.1.0/pbmc3k/pbmc3k_filtered_gene_bc_matrices.tar.gz"
 filepath = "pbmc3k.tar.gz"
@@ -36,9 +97,7 @@ adata.var_names_make_unique()
 adata.var['mt'] = adata.var_names.str.startswith('MT-')
 sc.pp.calculate_qc_metrics(adata, qc_vars=['mt'], percent_top=None, log1p=False, inplace=True)
 
-
 sc.external.pp.scrublet(adata)
-
 adata = adata[~adata.obs['predicted_doublet'], :].copy()
 
 sc.pp.filter_cells(adata, min_genes=200)
@@ -46,8 +105,13 @@ adata = adata[adata.obs['n_genes_by_counts'] < 2500, :]
 adata = adata[adata.obs['pct_counts_mt'] < 5, :]
 sc.pp.filter_genes(adata, min_cells=3)
 
+
 sc.pp.normalize_total(adata, target_sum=1e4)
 sc.pp.log1p(adata)
+
+
+impute_wnid_scanpy(adata, k=7, dropout_thresh=0.72, n_pcs=30)
+
 
 s_genes = ['MCM5', 'PCNA', 'TYMS', 'FEN1', 'MCM2', 'MCM4', 'RRM1', 'UNG', 'GINS2', 'MCM6']
 g2m_genes = ['HMGB2', 'CDK1', 'NUSAP1', 'UBE2C', 'BIRC5', 'TPX2', 'TOP2A', 'NDC80', 'CKS2', 'NUF2']
@@ -55,17 +119,16 @@ s_genes = [g for g in s_genes if g in adata.var_names]
 g2m_genes = [g for g in g2m_genes if g in adata.var_names]
 sc.tl.score_genes_cell_cycle(adata, s_genes=s_genes, g2m_genes=g2m_genes)
 
-sc.pp.highly_variable_genes(adata, n_top_genes=2000)
-adata.raw = adata # Save raw data
-sc.pp.scale(adata, max_value=10)
 
+sc.pp.highly_variable_genes(adata, n_top_genes=2000)
+
+adata.raw = adata
+
+sc.pp.scale(adata, max_value=10)
 adata.obs['batch'] = pd.Categorical(np.random.choice(['Donor_A', 'Donor_B'], size=adata.n_obs))
 sc.tl.pca(adata, svd_solver='arpack', n_comps=50)
 
-
 ho = hm.run_harmony(adata.obsm['X_pca'], adata.obs, ['batch'])
-
-
 if ho.Z_corr.shape[0] == adata.n_obs:
     adata.obsm['X_pca_harmony'] = ho.Z_corr
 else:
@@ -76,16 +139,19 @@ sc.pp.neighbors(adata, n_neighbors=10, n_pcs=40, use_rep='X_pca_harmony')
 sc.tl.umap(adata, min_dist=0.3)
 sc.tl.leiden(adata, resolution=0.5, key_added='leiden')
 
+
 sc.tl.diffmap(adata)
 root_idx = np.where(adata.obs['leiden'] == '0')[0][0]
 adata.uns['iroot'] = root_idx
 sc.tl.dpt(adata)
+
 
 sc.tl.rank_genes_groups(adata, groupby='leiden', method='t-test', use_raw=True)
 
 canonical_markers = ['CD3D', 'CD3E', 'CD3G', 'CD19', 'MS4A1', 'CD14', 'LYZ']
 available_markers = [g for g in canonical_markers if g in adata.var_names]
 sc.tl.score_genes(adata, gene_list=[g for g in ['CD3D', 'CD3E'] if g in adata.var_names], score_name='T_cell_score')
+
 
 sc.pl.umap(adata, color=['leiden', 'batch'], save='_clusters.png', show=False)
 sc.pl.umap(adata, color='phase', save='_phase.png', show=False)
@@ -104,12 +170,9 @@ df_volcano = pd.DataFrame({
 df_volcano['nlog10_pval'] = -np.log10(df_volcano['pval_adj'].clip(lower=1e-300))
 
 plt.figure(figsize=(8, 6))
-sns.scatterplot(data=df_volcano, x='lfc', y='nlog10_pval',
-                color="grey", alpha=0.5, edgecolor=None, s=15)
-
+sns.scatterplot(data=df_volcano, x='lfc', y='nlog10_pval', color="grey", alpha=0.5, edgecolor=None, s=15)
 sig = df_volcano[(df_volcano['lfc'] > 0.5) & (df_volcano['pval_adj'] < 0.05)]
-sns.scatterplot(data=sig, x='lfc', y='nlog10_pval',
-                color="red", alpha=0.8, edgecolor=None, s=20)
+sns.scatterplot(data=sig, x='lfc', y='nlog10_pval', color="red", alpha=0.8, edgecolor=None, s=20)
 
 plt.axvline(x=0.5, color='black', linestyle='--', linewidth=0.5)
 plt.axvline(x=-0.5, color='black', linestyle='--', linewidth=0.5)
@@ -119,6 +182,7 @@ plt.xlabel("Log2 Fold Change")
 plt.ylabel("-Log10 Adjusted P-value")
 plt.savefig("volcano_cluster0.png", bbox_inches='tight', dpi=100)
 plt.close()
+
 
 df_plot = pd.DataFrame({
     'UMAP1': adata.obsm['X_umap'][:, 0],
