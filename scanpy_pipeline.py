@@ -207,6 +207,11 @@ df_plot = pd.DataFrame({
 fig = px.scatter(df_plot, x='UMAP1', y='UMAP2', color='Cluster', hover_data=['Pseudotime'], title='Interactive UMAP')
 fig.write_html("interactive_umap.html")
 
+sc.tl.rank_genes_groups(adata, groupby='leiden', method='t-test', use_raw=True)
+
+cluster0_top_genes = pd.DataFrame(adata.uns['rank_genes_groups']['names'])['0'].head(3).tolist()
+print(f"Top 3 markers for Cluster 0: {cluster0_top_genes}")
+
 print_memory_usage("Before saving H5AD file")
 
 adata.write("pbmc3k_full_analysis_scanpy.h5ad")
