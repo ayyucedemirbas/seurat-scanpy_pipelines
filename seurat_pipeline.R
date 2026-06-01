@@ -7,19 +7,21 @@ library(ggplot2)
 library(plotly)
 library(irlba)
 library(RANN)
+library(ps)
 
 start_time <- Sys.time()
 
 print_profile <- function(step_name) {
   current_time <- Sys.time()
   elapsed <- as.numeric(difftime(current_time, start_time, units = "secs"))
-  gc_info <- gc(reset = FALSE)
-  mem_mb <- sum(gc_info[, 2])
+  
+  p <- ps::ps_handle()
+  mem_info <- ps::ps_memory_info(p)
+  mem_mb <- mem_info[["rss"]] / (1024^2)
   
   cat(sprintf("[Profile] %s | Time Elapsed: %.2f s | Memory Usage: %.2f MB\n", step_name, elapsed, mem_mb))
 }
 
-# --- WNID Imputation in R (Updated for Seurat v5) ---
 impute_wnid_seurat <- function(seurat_obj, k = 3, dropout_thresh = 0.9, n_pcs = 30) {
 
   X <- t(as.matrix(GetAssayData(seurat_obj, layer = "data")))
